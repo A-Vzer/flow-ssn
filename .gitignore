@@ -3,3 +3,5 @@ PKG-INFO
 *.txt
 *.pyc
 /datasets/lidc
+*.pickle
+*.hdf5
