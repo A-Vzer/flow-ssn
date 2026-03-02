@@ -18,6 +18,7 @@ from gssn.utils import seed_all, count_params, EMA, create_lr_schedule
 from gssn.factory import parse_ssn_args, parse_nn_args, build_nn
 from gssn.eval.metrics import energy_distance, hungarian_matched_iou, dice_score
 from gssn.models.continuous.model import ContinuousFlowSSN
+from gssn.models.gnn.model import GaussianSegmentationNetwork
 from gssn.data.lidc import get_lidc, make_dataloader, preprocess_lidc_fn, augment_lidc_batch
 
 
@@ -34,7 +35,7 @@ def train_step(
     mc_samples: int,
     deterministic: bool,
     *,
-    model: ContinuousFlowSSN,
+    model: nn.Module,  # Can be ContinuousFlowSSN or GaussianSegmentationNetwork
     optimizer: optax.GradientTransformation,
 ):
     """Single training step.
@@ -107,13 +108,13 @@ def eval_batch(
 
 
 def run_eval_epoch(
-    model: ContinuousFlowSSN,
+    model: nn.Module,  # Can be ContinuousFlowSSN or GaussianSegmentationNetwork
     params: Any,
     dataset: Any,
     rng: jax.Array,
     batch_size: int,
     eval_samples: int,
-    eval_T: int,
+    eval_T: Optional[int] = None,  # Only used by ContinuousFlowSSN
     num_classes: int = 2,
 ) -> Dict[str, float]:
     """Run evaluation over an entire dataset split."""
@@ -140,13 +141,19 @@ def run_eval_epoch(
             rng_model, rng_micro = jax.random.split(rng_model)
             micro_batch = {k: v[i:i + micro_bs] for k, v in batch.items()}
 
+            # Build kwargs - only pass eval_T if provided (for ContinuousFlowSSN)
+            apply_kwargs = {
+                "mc_samples": eval_samples,
+                "rng": rng_micro,
+                "deterministic": True,
+            }
+            if eval_T is not None:
+                apply_kwargs["eval_T"] = eval_T
+
             out = model.apply(
                 params,
                 {"x": micro_batch["x"]},
-                mc_samples=eval_samples,
-                rng=rng_micro,
-                eval_T=eval_T,
-                deterministic=True,
+                **apply_kwargs,
                 rngs={"sample": rng_micro},
             )
             probs = out["probs"]
@@ -197,12 +204,17 @@ def main():
     parser.add_argument("--eval_freq", type=int, default=8)
     parser.add_argument("--eval_samples", type=int, default=32)
     # MODEL
-    parser.add_argument("--model", type=str, choices=["c-flowssn"], default="c-flowssn")
+    parser.add_argument("--model", type=str, choices=["c-flowssn", "gauss"], default="c-flowssn")
     parser.add_argument("--net", type=str, choices=["unet"], default="unet")
     parser.add_argument("--base_net", type=str, choices=["unet", ""], default="")
+    parser.add_argument("--band_width", type=int, default=1, help="Banded covariance width (for gauss model)")
 
     args = parser.parse_known_args()[0]
-    args = parse_ssn_args(args.model, parser)
+    
+    # Only parse SSN args for flow-based models
+    if args.model == "c-flowssn":
+        args = parse_ssn_args(args.model, parser)
+    
     args = parse_nn_args(args.net, parser)
 
     if args.base_net:
@@ -218,20 +230,47 @@ def main():
         raise NotImplementedError(f"Unknown dataset: {args.dataset}")
 
     # --- Build model ---
-    flow_net = build_nn(args.net, args=args)[0]
+    if args.model == "c-flowssn":
+        # Flow-based model
+        flow_net = build_nn(args.net, args=args)[0]
 
-    base_net = None
-    if args.base_net and args.cond_base:
-        base_net = build_nn(args.base_net, args=args, prefix="base_")[0]
+        base_net = None
+        if args.base_net and args.cond_base:
+            base_net = build_nn(args.base_net, args=args, prefix="base_")[0]
 
-    model = ContinuousFlowSSN(
-        flow_net=flow_net,
-        base_net=base_net,
-        num_classes=args.num_classes,
-        cond_base=args.cond_base,
-        cond_flow=args.cond_flow,
-        base_std=args.base_std,
-    )
+        model = ContinuousFlowSSN(
+            flow_net=flow_net,
+            base_net=base_net,
+            num_classes=args.num_classes,
+            cond_base=args.cond_base,
+            cond_flow=args.cond_flow,
+            base_std=args.base_std,
+        )
+    elif args.model == "gauss":
+        # Gaussian Segmentation Network (no flow)
+        base_net = None
+        if args.base_net and hasattr(args, 'cond_base') and args.cond_base:
+            base_net = build_nn(args.base_net, args=args, prefix="base_")[0]
+        elif args.base_net:
+            # Default to conditional if not specified
+            base_net = build_nn(args.base_net, args=args, prefix="base_")[0]
+            args.cond_base = True
+        else:
+            args.cond_base = True  # Default for gauss model
+
+        # Set defaults for gauss model if not present
+        if not hasattr(args, 'base_std'):
+            args.base_std = 1.0
+
+        model = GaussianSegmentationNetwork(
+            base_net=base_net,
+            num_classes=args.num_classes,
+            cond_base=args.cond_base,
+            base_std=args.base_std,
+            band_width=args.band_width,
+        )
+    else:
+        raise ValueError(f"Unknown model: {args.model}")
 
     # --- Initialize parameters ---
     rng, init_rng = jax.random.split(rng)
@@ -335,12 +374,18 @@ def main():
             rng, rng_eval = jax.random.split(rng)
             eval_params = ema.get() if ema is not None else params
 
+            # Only pass eval_T for flow-based models
+            eval_kwargs = {
+                "batch_size": args.bs,
+                "eval_samples": args.eval_samples,
+                "num_classes": args.num_classes,
+            }
+            if args.model == "c-flowssn" and hasattr(args, 'eval_T'):
+                eval_kwargs["eval_T"] = args.eval_T
+            
             valid_metrics = run_eval_epoch(
                 model, eval_params, datasets["valid"], rng_eval,
-                batch_size=args.bs,
-                eval_samples=args.eval_samples,
-                eval_T=args.eval_T,
-                num_classes=args.num_classes,
+                **eval_kwargs,
             )
             wandb.log({"valid_" + k: v for k, v in valid_metrics.items()})
 
@@ -390,12 +435,19 @@ def main():
             ckpt = pickle.load(f)
 
         rng, rng_test = jax.random.split(rng)
+        
+        # Only pass eval_T for flow-based models
+        test_kwargs = {
+            "batch_size": args.bs,
+            "eval_samples": 100,
+            "num_classes": args.num_classes,
+        }
+        if args.model == "c-flowssn":
+            test_kwargs["eval_T"] = 50
+        
         test_metrics = run_eval_epoch(
             model, ckpt["params"], datasets["test"], rng_test,
-            batch_size=args.bs,
-            eval_samples=100,
-            eval_T=50,
-            num_classes=args.num_classes,
+            **test_kwargs,
         )
         print(f"{t} test ({ckpt_metric}): {', '.join(f'{k}: {v:.5f}' for k, v in test_metrics.items())}")
         print(f"{t} training_time: {elapsed}")
